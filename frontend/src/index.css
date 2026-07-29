@@ -1,0 +1,23 @@
+@import "tailwindcss";
+
+body {
+  margin: 0;
+}
+
+/* Wood shelf boards: repeats every (cover height + caption height + row gap)
+   = 190px + 68px + 40px = 298px. Covers sit flush on top of each 14px board
+   (190-204px within each period); the caption below clears it with pt-4. */
+.bookshelf-boards {
+  background-image: repeating-linear-gradient(
+    to bottom,
+    transparent 0px,
+    transparent 190px,
+    #c99a5f 190px,
+    #a8763f 193px,
+    #a8763f 201px,
+    #6b4423 201px,
+    #6b4423 204px,
+    transparent 204px,
+    transparent 298px
+  );
+}
