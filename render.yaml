@@ -1,0 +1,16 @@
+services:
+  - name: bookshelf-api
+    type: web
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      # Set once the Vercel frontend URL is known (step 2 of this deploy) —
+      # not a secret, just unknown at blueprint-creation time.
+      - key: FRONTEND_URL
+        sync: false

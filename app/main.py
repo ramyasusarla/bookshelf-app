@@ -1,3 +1,5 @@
+import os
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -9,9 +11,17 @@ Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Bookshelf API")
 
+# Local dev origin is always allowed; production adds the deployed frontend's
+# origin via env var so this doesn't need a code change (and redeploy) once
+# the frontend's URL is known.
+allowed_origins = ["http://localhost:5173"]
+frontend_url = os.environ.get("FRONTEND_URL")
+if frontend_url:
+    allowed_origins.append(frontend_url)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
