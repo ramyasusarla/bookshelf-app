@@ -4,8 +4,14 @@ from collections.abc import Generator
 from sqlalchemy import create_engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
-# Falls back to local SQLite for dev; production sets DATABASE_URL (Postgres).
-DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./bookshelf.db")
+# Postgres is required (not just supported) now that embeddings use
+# pgvector's Vector column type, which SQLite has no equivalent for. Local
+# dev defaults to the docker-compose Postgres service (see docker-compose.yml
+# — run `docker compose up -d` before starting the app); production sets
+# DATABASE_URL explicitly to the hosted instance.
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL", "postgresql+psycopg://bookshelf:bookshelf@localhost:5432/bookshelf"
+)
 
 # Providers (Neon, Render, Heroku-style) commonly hand out "postgres://" or
 # bare "postgresql://" URLs, but SQLAlchemy needs an explicit driver in the
@@ -16,9 +22,7 @@ if DATABASE_URL.startswith("postgres://"):
 elif DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
 
-connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
-
-engine = create_engine(DATABASE_URL, connect_args=connect_args)
+engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 

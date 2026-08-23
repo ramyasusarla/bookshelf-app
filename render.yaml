@@ -1,14 +1,32 @@
+databases:
+  # pgvector is available on Render's managed Postgres; the "vector"
+  # extension itself is created by migrations/versions/0001_initial_schema.py
+  # (via `alembic upgrade head`, run automatically before app start below).
+  - name: bookshelf-db
+    plan: free
+    postgresMajorVersion: "16"
+
 services:
   - name: bookshelf-api
     type: web
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    # Runs pending migrations before every deploy, then starts the app.
+    startCommand: alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: DATABASE_URL
-        sync: false
+        fromDatabase:
+          name: bookshelf-db
+          property: connectionString
       - key: OPENAI_API_KEY
+        sync: false
+      # Your Clerk app's Frontend API URL (Clerk dashboard -> API Keys ->
+      # look for the "Frontend API URL", e.g. https://your-app.clerk.accounts.dev,
+      # or your custom domain in prod) — used to verify session JWTs. Not the
+      # secret key; this URL is not sensitive, sync:false just because it's
+      # unknown at blueprint-creation time.
+      - key: CLERK_ISSUER
         sync: false
       # Set once the Vercel frontend URL is known (step 2 of this deploy) —
       # not a secret, just unknown at blueprint-creation time.

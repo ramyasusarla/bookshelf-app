@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { useAuth } from '@clerk/clerk-react'
 import { startRanking, submitRankChoice } from '../api'
 import type { ComparisonCandidate, RankResult, Tier } from '../types'
 import { BookCoverImage } from './BookCoverImage'
@@ -24,6 +25,7 @@ const TIER_OPTIONS: { tier: Tier; label: string }[] = [
 export function RankingDialog({ open, userBookId, onClose }: RankingDialogProps) {
   const dialogRef = useRef<HTMLDialogElement>(null)
   const queryClient = useQueryClient()
+  const { getToken } = useAuth()
 
   const [step, setStep] = useState<Step>({ kind: 'tier-select' })
   const [pendingChoiceId, setPendingChoiceId] = useState<number | null>(null)
@@ -49,16 +51,21 @@ export function RankingDialog({ open, userBookId, onClose }: RankingDialogProps)
   }
 
   const rankMutation = useMutation({
-    mutationFn: (tier: Tier) => {
+    mutationFn: async (tier: Tier) => {
       if (userBookId == null) throw new Error('no book to rank')
-      return startRanking(userBookId, tier)
+      return startRanking(await getToken(), userBookId, tier)
     },
     onSuccess: handleResult,
   })
 
   const choiceMutation = useMutation({
-    mutationFn: ({ sessionId, preferredUserBookId }: { sessionId: number; preferredUserBookId: number }) =>
-      submitRankChoice(sessionId, preferredUserBookId),
+    mutationFn: async ({
+      sessionId,
+      preferredUserBookId,
+    }: {
+      sessionId: number
+      preferredUserBookId: number
+    }) => submitRankChoice(await getToken(), sessionId, preferredUserBookId),
     onSuccess: (result) => {
       setPendingChoiceId(null)
       handleResult(result)

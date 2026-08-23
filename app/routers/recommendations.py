@@ -1,10 +1,10 @@
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
+from app.auth import get_current_user
 from app.database import get_db
-from app.embeddings import cosine_similarity
-from app.models import Category
-from app.recommendations import compute_taste_vector, get_candidate_pool, refresh_candidates
+from app.models import Category, User
+from app.recommendations import compute_taste_vector, get_top_candidates, refresh_candidates
 from app.schemas import RecommendationOut, RecommendationsResponse
 
 router = APIRouter()
@@ -16,8 +16,9 @@ TOP_N = 3
 async def get_recommendations(
     category: Category | None = Query(default=None),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ) -> RecommendationsResponse:
-    taste_vector = await compute_taste_vector(db, category)
+    taste_vector = await compute_taste_vector(db, current_user.id, category)
     if taste_vector is None:
         scope = f"the {category.value} genre" if category is not None else "your library"
         return RecommendationsResponse(
@@ -25,12 +26,7 @@ async def get_recommendations(
             message=f"Rate at least one book 7 or higher in {scope} to get recommendations.",
         )
 
-    pool = await get_candidate_pool(db, category)
-    scored = sorted(
-        ((c, cosine_similarity(taste_vector, c.embedding)) for c in pool),
-        key=lambda pair: pair[1],
-        reverse=True,
-    )
+    scored = await get_top_candidates(db, current_user.id, category, taste_vector, TOP_N)
 
     return RecommendationsResponse(
         recommendations=[
@@ -42,7 +38,7 @@ async def get_recommendations(
                 open_library_id=c.open_library_id,
                 similarity=round(score, 4),
             )
-            for c, score in scored[:TOP_N]
+            for c, score in scored
         ]
     )
 
@@ -51,6 +47,10 @@ async def get_recommendations(
 async def refresh_recommendations(
     category: Category | None = Query(default=None),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ) -> dict[str, list[str]]:
+    # current_user isn't used directly — the candidate cache this refreshes
+    # is global, not per-user — but this still costs real OpenAI calls, so
+    # it's gated behind auth like every other route rather than left public.
     refreshed = await refresh_candidates(db, category)
     return {"refreshed": [c.value for c in refreshed]}

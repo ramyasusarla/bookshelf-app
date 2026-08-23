@@ -1,4 +1,5 @@
 import { useQuery } from '@tanstack/react-query'
+import { useAuth } from '@clerk/clerk-react'
 import { fetchRecommendations } from '../api'
 import type { Category, Recommendation } from '../types'
 import { CATEGORY_LABELS } from '../types'
@@ -11,10 +12,11 @@ interface RecommendationsPanelProps {
 
 export function RecommendationsPanel({ genreFilter }: RecommendationsPanelProps) {
   const category = genreFilter === ALL_GENRES ? undefined : (genreFilter as Category)
+  const { getToken } = useAuth()
 
   const { data, isLoading, isError, error } = useQuery({
     queryKey: ['recommendations', genreFilter],
-    queryFn: () => fetchRecommendations(category),
+    queryFn: async () => fetchRecommendations(await getToken(), category),
   })
 
   return (

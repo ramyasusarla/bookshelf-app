@@ -1,6 +1,7 @@
 import enum
 from datetime import date, datetime
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     Date,
     DateTime,
@@ -15,6 +16,10 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+
+# text-embedding-3-small's fixed output dimensionality — pgvector needs a
+# declared size to size its on-disk storage and (optionally) build an index.
+EMBEDDING_DIMENSIONS = 1536
 
 
 class ReadStatus(str, enum.Enum):
@@ -45,6 +50,22 @@ class Tier(str, enum.Enum):
     LIKED_IT = "liked_it"
 
 
+class User(Base):
+    """A signed-in person (identity managed by Clerk). Rows are created
+    lazily on first successful token verification — see app/auth.py."""
+
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    clerk_id: Mapped[str] = mapped_column(String, unique=True, index=True, nullable=False)
+    email: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    user_books: Mapped[list["UserBook"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+
+
 class Book(Base):
     __tablename__ = "books"
     __table_args__ = (UniqueConstraint("open_library_id", name="uq_books_open_library_id"),)
@@ -56,11 +77,16 @@ class Book(Base):
     description: Mapped[str | None] = mapped_column(String, nullable=True)
     category: Mapped[Category | None] = mapped_column(Enum(Category), nullable=True)
     open_library_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
-    # Cached embedding of description (or title/author if no description),
-    # computed once for the recommendations taste vector and reused forever —
-    # a book's description never changes, so there's no invalidation to do.
-    embedding: Mapped[list[float] | None] = mapped_column(JSON, nullable=True)
+    # Cached embedding of description, computed once for the recommendations
+    # taste vector and reused forever — a book's description never changes,
+    # so there's no invalidation to do. Null when there's no description to
+    # embed (see app/normalization.py — a placeholder title/author string is
+    # deliberately never embedded as a substitute). pgvector's Vector type
+    # round-trips as a plain list[float] through SQLAlchemy, same as the JSON
+    # column it replaces — no other code needed to change.
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(EMBEDDING_DIMENSIONS), nullable=True)
 
+    # Global catalog data — shared across all users, not scoped to one.
     user_entries: Mapped[list["UserBook"]] = relationship(
         back_populates="book", cascade="all, delete-orphan"
     )
@@ -70,11 +96,12 @@ class UserBook(Base):
     __tablename__ = "user_books"
     __table_args__ = (
         UniqueConstraint(
-            "category", "rank_position", name="uq_user_books_category_rank_position"
+            "user_id", "category", "rank_position", name="uq_user_books_user_category_rank_position"
         ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
     book_id: Mapped[int] = mapped_column(ForeignKey("books.id"), nullable=False)
     status: Mapped[ReadStatus] = mapped_column(
         Enum(ReadStatus), nullable=False, default=ReadStatus.BOOKMARKED
@@ -82,15 +109,16 @@ class UserBook(Base):
     rating: Mapped[float | None] = mapped_column(Float, nullable=True)
     tier: Mapped[Tier | None] = mapped_column(Enum(Tier), nullable=True)
     # Denormalized copy of book.category, set only once this entry is ranked.
-    # Lets the DB enforce rank_position uniqueness per category (a UNIQUE
-    # constraint can't span book.category and user_books.rank_position across
-    # two tables), and NULL/NULL pairs for unranked entries don't collide
-    # under standard SQL uniqueness semantics.
+    # Lets the DB enforce rank_position uniqueness per (user, category) — a
+    # UNIQUE constraint can't span book.category and user_books.rank_position
+    # across two tables — and NULL/NULL/NULL triples for unranked entries
+    # don't collide under standard SQL uniqueness semantics.
     category: Mapped[Category | None] = mapped_column(Enum(Category), nullable=True)
     rank_position: Mapped[int | None] = mapped_column(Integer, nullable=True)
     date_completed: Mapped[date | None] = mapped_column(Date, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
+    user: Mapped["User"] = relationship(back_populates="user_books")
     book: Mapped["Book"] = relationship(back_populates="user_entries")
 
 
@@ -106,6 +134,9 @@ class RankingSession(Base):
     __tablename__ = "ranking_sessions"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    # Redundant with user_books.user_id (reachable via user_book_id), but
+    # kept directly on this row so ownership checks don't need an extra join.
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
     user_book_id: Mapped[int] = mapped_column(ForeignKey("user_books.id"), nullable=False)
     tier: Mapped[Tier] = mapped_column(Enum(Tier), nullable=False)
     candidate_user_book_ids: Mapped[list[int]] = mapped_column(JSON, nullable=False)
@@ -138,5 +169,8 @@ class RecommendationCandidate(Base):
     author: Mapped[str] = mapped_column(String, nullable=False)
     cover_url: Mapped[str | None] = mapped_column(String, nullable=True)
     description: Mapped[str | None] = mapped_column(String, nullable=True)
-    embedding: Mapped[list[float]] = mapped_column(JSON, nullable=False)
+    # Nullable: normalize_book() can legitimately produce no embedding_text
+    # (no description available) — those candidates are stored so they're not
+    # re-fetched every request, but they're excluded from similarity scoring.
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(EMBEDDING_DIMENSIONS), nullable=True)
     fetched_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

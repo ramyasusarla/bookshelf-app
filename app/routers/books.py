@@ -4,7 +4,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app import open_library
+from app.auth import get_current_user
 from app.database import get_db
+from app.normalization import normalize_book
 from app.models import (
     Book,
     Category,
@@ -12,6 +14,7 @@ from app.models import (
     RankingSessionStatus,
     ReadStatus,
     Tier,
+    User,
     UserBook,
 )
 from app.schemas import (
@@ -44,8 +47,11 @@ async def search_books(q: str = Query(..., min_length=1)) -> list[BookSearchResu
 
 @router.post("/library", response_model=LibraryEntryOut, status_code=201)
 async def add_to_library(
-    payload: AddToLibraryRequest, db: Session = Depends(get_db)
+    payload: AddToLibraryRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ) -> UserBook:
+    # Book is the shared, global catalog — reused across every user's library.
     book = None
     if payload.open_library_id:
         book = (
@@ -57,18 +63,26 @@ async def add_to_library(
         description = payload.description
         if description is None and payload.open_library_id:
             description = await open_library.fetch_description(payload.open_library_id)
-        book = Book(
+        record = normalize_book(
             title=payload.title,
-            author=payload.author,
+            open_library_id=payload.open_library_id,
+            raw_authors=payload.author,
             cover_url=payload.cover_url,
             description=description,
-            category=payload.category,
-            open_library_id=payload.open_library_id,
+        )
+        book = Book(
+            title=record.title,
+            author=record.author,
+            cover_url=record.cover_url,
+            description=record.description,
+            category=payload.category or record.category_guess,
+            open_library_id=record.open_library_id,
         )
         db.add(book)
         db.flush()
 
     user_book = UserBook(
+        user_id=current_user.id,
         book_id=book.id,
         status=payload.status,
         date_completed=payload.date_completed,
@@ -80,21 +94,29 @@ async def add_to_library(
 
 
 @router.get("/library", response_model=list[LibraryEntryOut])
-def list_library(db: Session = Depends(get_db)) -> list[UserBook]:
-    return db.query(UserBook).order_by(UserBook.created_at.desc()).all()
+def list_library(
+    db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
+) -> list[UserBook]:
+    return (
+        db.query(UserBook)
+        .filter(UserBook.user_id == current_user.id)
+        .order_by(UserBook.created_at.desc())
+        .all()
+    )
 
 
 def _category_book_ids(category: Category):
     return select(Book.id).where(Book.category == category).scalar_subquery()
 
 
-def _tier_start_position(db: Session, category: Category, tier: Tier) -> int:
+def _tier_start_position(db: Session, user_id: int, category: Category, tier: Tier) -> int:
     lower_tiers = TIER_ORDER[: TIER_ORDER.index(tier)]
     if not lower_tiers:
         return 1
     count = (
         db.query(UserBook)
         .filter(
+            UserBook.user_id == user_id,
             UserBook.book_id.in_(_category_book_ids(category)),
             UserBook.tier.in_(lower_tiers),
         )
@@ -103,10 +125,11 @@ def _tier_start_position(db: Session, category: Category, tier: Tier) -> int:
     return 1 + count
 
 
-def _tier_candidates(db: Session, category: Category, tier: Tier) -> list[UserBook]:
+def _tier_candidates(db: Session, user_id: int, category: Category, tier: Tier) -> list[UserBook]:
     return (
         db.query(UserBook)
         .filter(
+            UserBook.user_id == user_id,
             UserBook.book_id.in_(_category_book_ids(category)),
             UserBook.tier == tier,
         )
@@ -115,9 +138,9 @@ def _tier_candidates(db: Session, category: Category, tier: Tier) -> list[UserBo
     )
 
 
-def _recompute_tier_ratings(db: Session, category: Category, tier: Tier) -> None:
+def _recompute_tier_ratings(db: Session, user_id: int, category: Category, tier: Tier) -> None:
     lo, hi = TIER_RATING_RANGES[tier]
-    members = _tier_candidates(db, category, tier)  # ascending rank_position: worst -> best
+    members = _tier_candidates(db, user_id, category, tier)  # ascending rank_position: worst -> best
     n = len(members)
     for local_rank, member in enumerate(members, start=1):
         if n == 1:
@@ -137,16 +160,19 @@ def _to_candidate(user_book: UserBook) -> ComparisonCandidate:
 
 def _place_book(db: Session, user_book: UserBook, tier: Tier, position: int) -> None:
     category = user_book.book.category
+    user_id = user_book.user_id
 
-    # Shift highest rank_position first: with a UNIQUE(category, rank_position)
-    # constraint, a single batched UPDATE can momentarily duplicate a position
-    # mid-statement depending on row-processing order (e.g. moving 3->4 before
-    # the existing 4 has moved to 5). Updating highest-to-lowest always frees
-    # the target slot before anything else claims it.
+    # Shift highest rank_position first: with a UNIQUE(user_id, category,
+    # rank_position) constraint, a single batched UPDATE can momentarily
+    # duplicate a position mid-statement depending on row-processing order
+    # (e.g. moving 3->4 before the existing 4 has moved to 5). Updating
+    # highest-to-lowest always frees the target slot before anything else
+    # claims it.
     shifted_ids = [
         row.id
         for row in db.query(UserBook.id)
         .filter(
+            UserBook.user_id == user_id,
             UserBook.book_id.in_(_category_book_ids(category)),
             UserBook.rank_position >= position,
         )
@@ -166,7 +192,7 @@ def _place_book(db: Session, user_book: UserBook, tier: Tier, position: int) -> 
     user_book.status = ReadStatus.READ
     try:
         db.flush()
-        _recompute_tier_ratings(db, category, tier)
+        _recompute_tier_ratings(db, user_id, category, tier)
         db.commit()
     except IntegrityError:
         db.rollback()
@@ -177,32 +203,53 @@ def _place_book(db: Session, user_book: UserBook, tier: Tier, position: int) -> 
     db.refresh(user_book)
 
 
-def _get_user_book_or_404(db: Session, user_book_id: int) -> UserBook:
-    user_book = db.query(UserBook).filter(UserBook.id == user_book_id).first()
+def _get_user_book_or_404(db: Session, user_id: int, user_book_id: int) -> UserBook:
+    # Scoped by user_id so a mismatched owner 404s rather than leaking
+    # another user's row's existence.
+    user_book = (
+        db.query(UserBook)
+        .filter(UserBook.id == user_book_id, UserBook.user_id == user_id)
+        .first()
+    )
     if user_book is None:
         raise HTTPException(status_code=404, detail="library entry not found")
     return user_book
 
 
+def _get_ranking_session_or_404(db: Session, user_id: int, session_id: int) -> RankingSession:
+    session = (
+        db.query(RankingSession)
+        .filter(RankingSession.id == session_id, RankingSession.user_id == user_id)
+        .first()
+    )
+    if session is None:
+        raise HTTPException(status_code=404, detail="ranking session not found")
+    return session
+
+
 @router.post("/library/{user_book_id}/rank", response_model=RankComparison | RankPlaced)
 def start_ranking(
-    user_book_id: int, payload: RankRequest, db: Session = Depends(get_db)
+    user_book_id: int,
+    payload: RankRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ) -> RankComparison | RankPlaced:
-    user_book = _get_user_book_or_404(db, user_book_id)
+    user_book = _get_user_book_or_404(db, current_user.id, user_book_id)
     if user_book.tier is not None:
         raise HTTPException(status_code=400, detail="book is already ranked")
     if user_book.book.category is None:
         raise HTTPException(status_code=400, detail="book must have a category before ranking")
 
     tier = payload.tier
-    candidates = _tier_candidates(db, user_book.book.category, tier)
+    candidates = _tier_candidates(db, current_user.id, user_book.book.category, tier)
 
     if not candidates:
-        position = _tier_start_position(db, user_book.book.category, tier)
+        position = _tier_start_position(db, current_user.id, user_book.book.category, tier)
         _place_book(db, user_book, tier, position)
         return RankPlaced(user_book=user_book)
 
     session = RankingSession(
+        user_id=current_user.id,
         user_book_id=user_book.id,
         tier=tier,
         candidate_user_book_ids=[c.id for c in candidates],
@@ -222,16 +269,18 @@ def start_ranking(
 
 
 @router.get("/library/rank-sessions/{session_id}", response_model=RankComparison)
-def get_ranking_session(session_id: int, db: Session = Depends(get_db)) -> RankComparison:
-    session = db.query(RankingSession).filter(RankingSession.id == session_id).first()
-    if session is None:
-        raise HTTPException(status_code=404, detail="ranking session not found")
+def get_ranking_session(
+    session_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> RankComparison:
+    session = _get_ranking_session_or_404(db, current_user.id, session_id)
     if session.status != RankingSessionStatus.IN_PROGRESS:
         raise HTTPException(status_code=400, detail="ranking session already completed")
 
-    new_user_book = _get_user_book_or_404(db, session.user_book_id)
+    new_user_book = _get_user_book_or_404(db, current_user.id, session.user_book_id)
     mid = (session.lo + session.hi) // 2
-    candidate = _get_user_book_or_404(db, session.candidate_user_book_ids[mid])
+    candidate = _get_user_book_or_404(db, current_user.id, session.candidate_user_book_ids[mid])
     return RankComparison(
         session_id=session.id,
         new_book=_to_candidate(new_user_book),
@@ -244,11 +293,12 @@ def get_ranking_session(session_id: int, db: Session = Depends(get_db)) -> RankC
     response_model=RankComparison | RankPlaced,
 )
 def submit_ranking_choice(
-    session_id: int, payload: ChoiceRequest, db: Session = Depends(get_db)
+    session_id: int,
+    payload: ChoiceRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ) -> RankComparison | RankPlaced:
-    session = db.query(RankingSession).filter(RankingSession.id == session_id).first()
-    if session is None:
-        raise HTTPException(status_code=404, detail="ranking session not found")
+    session = _get_ranking_session_or_404(db, current_user.id, session_id)
     if session.status != RankingSessionStatus.IN_PROGRESS:
         raise HTTPException(status_code=400, detail="ranking session already completed")
 
@@ -268,11 +318,11 @@ def submit_ranking_choice(
     db.commit()
     db.refresh(session)
 
-    new_user_book = _get_user_book_or_404(db, session.user_book_id)
+    new_user_book = _get_user_book_or_404(db, current_user.id, session.user_book_id)
 
     if session.lo < session.hi:
         next_mid = (session.lo + session.hi) // 2
-        next_candidate = _get_user_book_or_404(db, candidates[next_mid])
+        next_candidate = _get_user_book_or_404(db, current_user.id, candidates[next_mid])
         return RankComparison(
             session_id=session.id,
             new_book=_to_candidate(new_user_book),
@@ -280,7 +330,7 @@ def submit_ranking_choice(
         )
 
     idx = session.lo
-    tier_start = _tier_start_position(db, new_user_book.book.category, session.tier)
+    tier_start = _tier_start_position(db, current_user.id, new_user_book.book.category, session.tier)
     position = tier_start + idx
     _place_book(db, new_user_book, session.tier, position)
 

@@ -3,12 +3,12 @@ import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.database import Base, engine
+from app.embeddings import get_embedding_cache_stats
 from app.routers.books import router as books_router
 from app.routers.recommendations import router as recommendations_router
 
-Base.metadata.create_all(bind=engine)
-
+# Schema is managed by Alembic now (see migrations/), not created implicitly
+# at startup — run `alembic upgrade head` before starting the app.
 app = FastAPI(title="Bookshelf API")
 
 # Local dev origin is always allowed; production adds the deployed frontend's
@@ -34,3 +34,11 @@ app.include_router(recommendations_router)
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/internal/cache-stats")
+def cache_stats() -> dict:
+    """Embedding cache hit/miss counters — see app/embeddings.py. Lets a real
+    cache-hit-rate number be captured (e.g. before/after a
+    POST /recommendations/refresh) instead of an estimate."""
+    return get_embedding_cache_stats()

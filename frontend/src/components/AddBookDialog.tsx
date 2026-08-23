@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent, type MouseEvent } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useAuth } from '@clerk/clerk-react'
 import { addToLibrary, searchBooks } from '../api'
 import { useDebouncedValue } from '../hooks/useDebouncedValue'
 import type { BookSearchResult, Category, LibraryEntry } from '../types'
@@ -17,6 +18,7 @@ interface AddBookDialogProps {
 export function AddBookDialog({ open, onClose, onAdded }: AddBookDialogProps) {
   const dialogRef = useRef<HTMLDialogElement>(null)
   const queryClient = useQueryClient()
+  const { getToken } = useAuth()
 
   const [searchTerm, setSearchTerm] = useState('')
   const debouncedSearchTerm = useDebouncedValue(searchTerm, 150)
@@ -33,7 +35,8 @@ export function AddBookDialog({ open, onClose, onAdded }: AddBookDialogProps) {
   })
 
   const addMutation = useMutation({
-    mutationFn: addToLibrary,
+    mutationFn: async (payload: Parameters<typeof addToLibrary>[1]) =>
+      addToLibrary(await getToken(), payload),
     onSuccess: (entry) => {
       queryClient.invalidateQueries({ queryKey: ['library'] })
       onAdded(entry)

@@ -4,34 +4,9 @@ import httpx
 from sqlalchemy.orm import Session
 
 from app import open_library
-from app.embeddings import average_vectors, generate_embedding
+from app.embeddings import average_vectors, generate_embeddings_batch, record_cache_hit, record_cache_miss
 from app.models import Book, Category, RecommendationCandidate, UserBook
-
-# Open Library subject slugs, verified against the live API (checked
-# work_count for each before picking) rather than guessed:
-#   - REALISTIC_FICTION -> "realistic_fiction" is a real subject but thin
-#     (~150 works). Open Library doesn't have a strong equivalent for this
-#     school/library-style category, so this genre's candidate pool will
-#     usually be small.
-#   - MEMOIR -> "memoir" is real but also thin (~330 works).
-#   - SELF_HELP -> Open Library has two distinct subjects here: "self-help"
-#     (hyphen, ~4k works, canonical display name "self-help") and
-#     "self_help" (underscore, ~700 works, display name "self help") as a
-#     separate, smaller subject. Picked the larger hyphenated one.
-# Everything else (fantasy, science_fiction, mystery, romance,
-# historical_fiction, biography, history) mapped cleanly with large pools.
-GENRE_SUBJECT_MAP: dict[Category, str] = {
-    Category.FANTASY: "fantasy",
-    Category.SCI_FI: "science_fiction",
-    Category.MYSTERY: "mystery",
-    Category.ROMANCE: "romance",
-    Category.HISTORICAL_FICTION: "historical_fiction",
-    Category.REALISTIC_FICTION: "realistic_fiction",
-    Category.BIOGRAPHY: "biography",
-    Category.MEMOIR: "memoir",
-    Category.SELF_HELP: "self-help",
-    Category.HISTORY: "history",
-}
+from app.normalization import GENRE_SUBJECT_MAP, normalize_book
 
 SUBJECT_URL = "https://openlibrary.org/subjects/{slug}.json"
 COVER_URL = "https://covers.openlibrary.org/b/id/{cover_id}-M.jpg"
@@ -58,7 +33,7 @@ class Candidate:
         author: str,
         cover_url: str | None,
         description: str | None,
-        embedding: list[float],
+        embedding: list[float] | None,
     ) -> None:
         self.open_library_id = open_library_id
         self.title = title
@@ -76,36 +51,65 @@ async def _fetch_subject_works(slug: str, limit: int) -> list[dict]:
             return response.json().get("works", [])
 
 
-async def _build_candidate(work: dict) -> Candidate | None:
-    work_key = work.get("key")
-    title = work.get("title")
-    if not work_key or not title:
-        return None
-
-    authors = work.get("authors") or []
-    author = ", ".join(a["name"] for a in authors if a.get("name")) or "Unknown"
-    cover_id = work.get("cover_id")
-    cover_url = COVER_URL.format(cover_id=cover_id) if cover_id else None
-
+async def _fetch_description_capped(work_key: str) -> str | None:
     async with _request_semaphore:
-        description = await open_library.fetch_description(work_key)
-        embedding_text = description or f"{title} by {author}"
-        embedding = await generate_embedding(embedding_text)
+        return await open_library.fetch_description(work_key)
 
-    return Candidate(
-        open_library_id=work_key,
-        title=title,
-        author=author,
-        cover_url=cover_url,
-        description=description,
-        embedding=embedding,
+
+async def _build_candidates_batch(works: list[dict]) -> list[Candidate]:
+    """Build Candidates for a whole genre's worth of new works in one pass:
+    descriptions are still fetched with the existing per-request concurrency
+    cap (Open Library rate-limit protection), but every candidate that needs
+    an embedding is embedded in a single batched OpenAI call instead of one
+    call per candidate."""
+    valid_works = [w for w in works if w.get("key") and w.get("title")]
+    if not valid_works:
+        return []
+
+    descriptions = await asyncio.gather(
+        *(_fetch_description_capped(w["key"]) for w in valid_works)
     )
 
+    records = [
+        normalize_book(
+            title=work["title"],
+            open_library_id=work["key"],
+            raw_authors=work.get("authors"),
+            cover_url=COVER_URL.format(cover_id=work["cover_id"]) if work.get("cover_id") else None,
+            description=description,
+        )
+        for work, description in zip(valid_works, descriptions)
+    ]
 
-def _existing_open_library_ids(db: Session) -> set[str]:
+    texts_to_embed = [r.embedding_text for r in records if r.embedding_text is not None]
+    new_embeddings = await generate_embeddings_batch(texts_to_embed)
+    record_cache_miss(len(texts_to_embed))
+    embeddings_iter = iter(new_embeddings)
+
+    return [
+        Candidate(
+            open_library_id=record.open_library_id,
+            title=record.title,
+            author=record.author,
+            cover_url=record.cover_url,
+            description=record.description,
+            embedding=next(embeddings_iter) if record.embedding_text is not None else None,
+        )
+        for record in records
+    ]
+
+
+def _user_library_open_library_ids(db: Session, user_id: int) -> set[str]:
+    """Open Library IDs already in this specific user's library. The
+    recommendation-candidate cache itself is global (shared across users —
+    see RecommendationCandidate), so "already have this" can only be
+    evaluated per user, at read time, not baked into the shared cache."""
     return {
         row[0]
-        for row in db.query(Book.open_library_id).filter(Book.open_library_id.isnot(None)).all()
+        for row in db.query(Book.open_library_id)
+        .join(UserBook, UserBook.book_id == Book.id)
+        .filter(UserBook.user_id == user_id, Book.open_library_id.isnot(None))
+        .all()
     }
 
 
@@ -157,18 +161,15 @@ async def fetch_candidates_for_genre(
     if not force_refresh:
         cached = _load_cached_candidates(db, category)
         if cached:
+            # Serving this genre's whole pool from the DB avoids re-embedding
+            # every candidate in it — each one is an avoided OpenAI call.
+            record_cache_hit(sum(1 for c in cached if c.embedding is not None))
             return cached
 
     slug = GENRE_SUBJECT_MAP[category]
     works = await _fetch_subject_works(slug, CANDIDATES_PER_GENRE)
 
-    existing_ids = _existing_open_library_ids(db)
-    new_works = [w for w in works if w.get("key") not in existing_ids]
-
-    # Parallelize per-candidate description+embedding fetches — see
-    # performance notes: this is still the expensive part of a cold fetch.
-    built = await asyncio.gather(*(_build_candidate(w) for w in new_works))
-    candidates = [c for c in built if c is not None]
+    candidates = await _build_candidates_batch(works)
 
     _save_candidates(db, category, candidates)
     return candidates
@@ -182,22 +183,17 @@ async def refresh_candidates(db: Session, category: Category | None) -> list[Cat
     return categories
 
 
-async def _get_book_embedding(db: Session, book: Book) -> list[float]:
-    if book.embedding is not None:
-        return book.embedding
-    text = book.description or f"{book.title} by {book.author}"
-    async with _request_semaphore:
-        embedding = await generate_embedding(text)
-    book.embedding = embedding
-    db.commit()
-    return embedding
-
-
-async def compute_taste_vector(db: Session, category: Category | None) -> list[float] | None:
+async def compute_taste_vector(
+    db: Session, user_id: int, category: Category | None
+) -> list[float] | None:
     query = (
         db.query(UserBook)
         .join(Book)
-        .filter(UserBook.rating.isnot(None), UserBook.rating >= MIN_RATING_FOR_TASTE)
+        .filter(
+            UserBook.user_id == user_id,
+            UserBook.rating.isnot(None),
+            UserBook.rating >= MIN_RATING_FOR_TASTE,
+        )
     )
     if category is not None:
         query = query.filter(Book.category == category)
@@ -206,19 +202,67 @@ async def compute_taste_vector(db: Session, category: Category | None) -> list[f
     if not rated_books:
         return None
 
-    embeddings = await asyncio.gather(*(_get_book_embedding(db, book) for book in rated_books))
-    return average_vectors(embeddings)
+    already_cached = [b for b in rated_books if b.embedding is not None]
+    record_cache_hit(len(already_cached))
+
+    # No description to embed against — skip rather than embedding a weak
+    # title/author placeholder string (see app/normalization.py).
+    needs_embedding = [b for b in rated_books if b.embedding is None and b.description]
+    if needs_embedding:
+        new_embeddings = await generate_embeddings_batch([b.description for b in needs_embedding])
+        record_cache_miss(len(needs_embedding))
+        for book, embedding in zip(needs_embedding, new_embeddings):
+            book.embedding = embedding
+        db.commit()
+
+    usable_embeddings = [b.embedding for b in rated_books if b.embedding is not None]
+    return average_vectors(usable_embeddings)
 
 
-async def get_candidate_pool(db: Session, category: Category | None) -> list[Candidate]:
-    if category is not None:
-        pool = await fetch_candidates_for_genre(db, category)
-    else:
-        pools = await asyncio.gather(*(fetch_candidates_for_genre(db, c) for c in Category))
-        pool = [c for sub in pools for c in sub]
+async def get_top_candidates(
+    db: Session,
+    user_id: int,
+    category: Category | None,
+    taste_vector: list[float],
+    limit: int,
+) -> list[tuple[Candidate, float]]:
+    """Ensure the relevant genre(s)' candidate pools are cached, then rank
+    them against taste_vector with a single DB-side pgvector query instead of
+    pulling every embedding into Python and scoring it there — the ordering
+    itself, not just storage, now lives in Postgres."""
+    categories = [category] if category is not None else list(Category)
+    # fetch_candidates_for_genre's return value isn't needed here — this call
+    # just guarantees RecommendationCandidate has an up-to-date pool for each
+    # genre before the SQL query below reads it.
+    await asyncio.gather(*(fetch_candidates_for_genre(db, c) for c in categories))
 
-    # Belt-and-suspenders re-filter: a genre's cache may have been built
-    # before the user added more books, so re-check against the *current*
-    # library rather than trusting the fetch-time filter alone.
-    existing_ids = _existing_open_library_ids(db)
-    return [c for c in pool if c.open_library_id not in existing_ids]
+    # The candidate cache is global/shared across users, so "already have
+    # this" is filtered per-user here at read time, not baked into the cache.
+    existing_ids = _user_library_open_library_ids(db, user_id)
+
+    distance = RecommendationCandidate.embedding.cosine_distance(taste_vector)
+    query = (
+        db.query(RecommendationCandidate, distance.label("distance"))
+        .filter(
+            RecommendationCandidate.category.in_(categories),
+            RecommendationCandidate.embedding.isnot(None),
+        )
+    )
+    if existing_ids:
+        query = query.filter(RecommendationCandidate.open_library_id.notin_(existing_ids))
+    rows = query.order_by(distance.asc()).limit(limit).all()
+
+    return [
+        (
+            Candidate(
+                open_library_id=row.open_library_id,
+                title=row.title,
+                author=row.author,
+                cover_url=row.cover_url,
+                description=row.description,
+                embedding=row.embedding,
+            ),
+            1 - dist,
+        )
+        for row, dist in rows
+    ]
