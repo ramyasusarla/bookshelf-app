@@ -20,10 +20,16 @@ Usage:
 import argparse
 import json
 import sqlite3
+import sys
 from pathlib import Path
 
-from app.database import SessionLocal
-from app.models import Book, User, UserBook
+# Running this file directly (`python scripts/migrate_sqlite_data.py`) sets
+# sys.path[0] to scripts/, not the project root, so `app` isn't importable
+# without this — regardless of the caller's cwd or PYTHONPATH.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from app.database import SessionLocal  # noqa: E402
+from app.models import Book, User, UserBook  # noqa: E402
 
 
 def _load_sqlite_rows(sqlite_path: Path) -> tuple[list[dict], list[dict]]:
